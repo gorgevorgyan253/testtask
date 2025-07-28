@@ -1,0 +1,74 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app
+  labels:
+    app: app
+spec:
+  replicas: 2 # Минимум 2 пода для отказоустойчивости чтобы пережить сбой ноды/зоны
+  selector:
+    matchLabels:
+      app: app
+  template:
+    metadata:
+      labels:
+        app: app
+    spec:
+      topologySpreadConstraints:
+        # Распределяем поды по зонам для отказоустойчивости
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: app
+      containers:
+        - name: app
+          image: app-image:latest
+          resources:
+            requests:
+              cpu: "0.2"      # Запрашиваем чуть больше, чтобы учесть пиковую инициализацию
+              memory: "128Mi" # Постоянное потребление памяти
+            limits:
+              cpu: "1"        # Ограничиваем максимумом на период инициализации
+              memory: "256Mi" # С запасом, чтобы избежать OOM на старте
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10 # Учитываем 5-10 секунд на инициализацию
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: app-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: app
+  minReplicas: 2 # Минимум 2 для отказоустойчивости
+  maxReplicas: 4 # По нагрузочному тесту 4 пода справляются с пиком
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60 # Баланс между экономией и реакцией на рост нагрузки
+
+# Принятые решения:
+# - Минимум 2 пода для отказоустойчивости один может быть недоступен из-за сбоя ноды/зоны
+# - Максимум 4 пода — по результатам нагрузочного теста
+# - topologySpreadConstraints — для равномерного распределения по зонам
+# - requests/limits по CPU: requests чуть выше среднего, limits  с запасом для инициализации
+# - HPA по CPU, чтобы ночью поды масштабировались вниз, а днём  вверх
+# - readinessProbe с задержкой, чтобы не отправлять трафик на неинициализированный под
